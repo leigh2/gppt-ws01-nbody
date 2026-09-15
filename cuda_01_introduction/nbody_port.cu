@@ -6,9 +6,6 @@
 #include <string>
 #include <vector>
 
-#include <thrust/copy.h>
-#include <thrust/device_vector.h>
-
 using std::vector;
 
 #define PRECISION_SINGLE
@@ -24,24 +21,21 @@ struct Vec2 {
   real y;
 };
 
-__device__ __host__ real norm2(const Vec2 &v) { return v.x * v.x + v.y * v.y; }
+real norm2(const Vec2 &v) { return v.x * v.x + v.y * v.y; }
 
-__device__ __host__ Vec2 sub(const Vec2 &v1, const Vec2 &v2) { return {v1.x - v2.x, v1.y - v2.y}; }
+Vec2 sub(const Vec2 &v1, const Vec2 &v2) { return {v1.x - v2.x, v1.y - v2.y}; }
 
 #include "util.hpp" // This must be included *after* Vec2 definition
 
-__device__ __host__ Vec2 calc_acc_pair(Vec2 pi, Vec2 pj, real mj, real eps = 0.0) {
+Vec2 calc_acc_pair(Vec2 pi, Vec2 pj, real mj, real eps = 0.0) {
   const Vec2 r = sub(pj, pi);
   const real d = norm2(r) + eps * eps;
-#ifdef PRECISION_SINGLE
-  const real inv_d = rsqrtf(d); // only when real = float and not double
-#else
-  const real inv_d = 1.0 / sqrt(d); // the fallback when real = double
-#endif
+  const real inv_d = 1.0 / sqrt(d);
   const real accs = mj * inv_d * inv_d * inv_d;
   return {r.x * accs, r.y * accs};
 }
 
+/// Calculate acceleration on each particle due to every other particle
 void calc_acc(vector<Vec2> &acc, const vector<Vec2> &pos,
               const vector<real> &mass, real eps = 0.0) {
   for (int i = 0; i < acc.size(); ++i) {
@@ -58,41 +52,13 @@ void calc_acc(vector<Vec2> &acc, const vector<Vec2> &pos,
   }
 }
 
-__global__ void calc_acc_k(Vec2 *acc, const Vec2 *pos, const real *mass, uint N,
-                         real eps = 0.0) {
-  const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (gtid >= N)
-    return;
-
-  const Vec2 pi = pos[gtid];
-  Vec2 accl = {0.0, 0.0};
-
-  for (int j = 0; j < N; ++j) {
-    const Vec2 accll = calc_acc_pair(pi, pos[j], mass[j], eps);
-    accl.x += accll.x;
-    accl.y += accll.y;
-  }
-
-  acc[gtid] = accl;
-}
-
+/// Calculate next position of every particle from old position and acceleration
 void advance_pos(vector<Vec2> &pos, vector<Vec2> &pos_prev,
                  const vector<Vec2> &acc, real dt) {
   for (int i = 0; i < pos.size(); ++i) {
     pos_prev[i].x = 2.0 * pos[i].x - pos_prev[i].x + acc[i].x * dt * dt;
     pos_prev[i].y = 2.0 * pos[i].y - pos_prev[i].y + acc[i].y * dt * dt;
   }
-}
-
-__global__ void advance_pos_k(Vec2 *pos_prev, const Vec2 *pos, const Vec2 *acc,
-                            uint N, real dt) {
-  const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (gtid >= N)
-    return;
-  pos_prev[gtid].x =
-      2.0 * pos[gtid].x - pos_prev[gtid].x + acc[gtid].x * dt * dt;
-  pos_prev[gtid].y =
-      2.0 * pos[gtid].y - pos_prev[gtid].y + acc[gtid].y * dt * dt;
 }
 
 bool all_tests_pass();
@@ -113,9 +79,6 @@ int main(int argc, char *argv[]) {
       get_arg(argv, argv + argc, "--only_unit_tests");
   const real time_between_dumps = total_time/10;
   const real time_between_reports = total_time/100;
-
-  const int block_size = 256;
-  const int n_blocks = (N_PARTICLES + block_size - 1) / block_size;
 
   // Check tests
   bool tests_passed = true;
@@ -164,15 +127,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  thrust::device_vector<Vec2> pos_d(N_PARTICLES);
-  thrust::device_vector<Vec2> acc_d(N_PARTICLES);
-  thrust::device_vector<Vec2> pos_prev_d(N_PARTICLES);
-  thrust::device_vector<real> mass_d(N_PARTICLES);
-
-  thrust::copy(pos.begin(), pos.end(), pos_d.begin());
-  thrust::copy(mass.begin(), mass.end(), mass_d.begin());
-  thrust::copy(pos_prev.begin(), pos_prev.end(), pos_prev_d.begin());
-  thrust::copy(acc.begin(), acc.end(), acc_d.begin());
+  // TODO 4a
 
   // Timers & counters
   real t = 0; // simulation time
@@ -186,15 +141,9 @@ int main(int argc, char *argv[]) {
   Timer<std::chrono::microseconds> timer;
 
   while (t < total_time) {
-    calc_acc_k<<<n_blocks, block_size>>>(acc_d.data().get(), pos_d.data().get(),
-                                       mass_d.data().get(), N_PARTICLES,
-                                       epsilon);
-    advance_pos_k<<<n_blocks, block_size>>>(pos_prev_d.data().get(),
-                                          pos_d.data().get(),
-                                          acc_d.data().get(), N_PARTICLES, dt);
-    pos_d.swap(pos_prev_d);
-
-    cudaDeviceSynchronize();
+    calc_acc(acc, pos, mass, epsilon);
+    advance_pos(pos, pos_prev, acc, dt);
+    pos.swap(pos_prev);
 
     time_per_loop = timer.lap();
     total_elapsed_us += time_per_loop;
@@ -204,7 +153,6 @@ int main(int argc, char *argv[]) {
 
     if (t > time_to_next_dump and dump_data) {
       time_to_next_dump += time_between_dumps;
-      thrust::copy(pos_d.begin(), pos_d.end(), pos.begin());
       dump_to_file(format_fname(dump_counter), pos);
       dump_counter += 1;
     }
@@ -231,7 +179,6 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  thrust::copy(pos_d.begin(), pos_d.end(), pos.begin());
   dump_to_file("final.csv", pos);
   std::cout << "N_PARTICLES: " << N_PARTICLES << "\n";
   std::cout << "Steps: " << loop_counter << "\n";
@@ -256,17 +203,15 @@ bool assert_nearly_eql(const Vec2 &v1, const Vec2 &v2, real eps = 1e-6) {
 }
 
 bool test_calc_acc_x() {
-  thrust::device_vector<real> mass({2.0, 0.5});
-  thrust::device_vector<Vec2> pos({{0.0, 0.0}, {1.0, 0.0}});
-  thrust::device_vector<Vec2> acc(pos.size());
+  vector<real> mass({2.0, 0.5});
+  vector<Vec2> pos({{0.0, 0.0}, {1.0, 0.0}});
+  vector<Vec2> acc(pos.size());
 
   const real epsilon = 1.1 * std::pow(real(pos.size()), -0.48);
   const real e2 = std::pow(epsilon, 2);
   const real inv_d3 = std::pow(1 + e2, -1.5);
 
-  calc_acc_k<<<1, 32>>>(acc.data().get(), pos.data().get(), mass.data().get(),
-                      pos.size(), epsilon);
-  cudaDeviceSynchronize();
+  calc_acc(acc, pos, mass, epsilon);
 
   if (!assert_nearly_eql(acc[0], {mass[1] * inv_d3, 0}, 1e-5)) {
     return false;
@@ -280,17 +225,16 @@ bool test_calc_acc_x() {
 }
 
 bool test_calc_acc_y() {
-  thrust::device_vector<real> mass({2.0, 0.5});
-  thrust::device_vector<Vec2> pos({{0.0, 0.0}, {0.0, 1.0}});
-  thrust::device_vector<Vec2> acc(pos.size());
+  // TODO 2: Comment out everything from HERE
+  vector<real> mass({2.0, 0.5});
+  vector<Vec2> pos({{0.0, 0.0}, {0.0, 1.0}});
+  vector<Vec2> acc(pos.size());
 
   const real epsilon = 1.1 * std::pow(real(pos.size()), -0.48);
   const real e2 = std::pow(epsilon, 2);
   const real inv_d3 = std::pow(1 + e2, -1.5);
 
-  calc_acc_k<<<1, 32>>>(acc.data().get(), pos.data().get(), mass.data().get(),
-                      pos.size(), epsilon);
-  cudaDeviceSynchronize();
+  calc_acc(acc, pos, mass, epsilon);
 
   if (!assert_nearly_eql(acc[0], {0, mass[1] * inv_d3}, 1e-5)) {
     return false;
@@ -299,6 +243,7 @@ bool test_calc_acc_y() {
   if (!assert_nearly_eql(acc[1], {0, -mass[0] * inv_d3}, 1e-5)) {
     return false;
   }
+  // TODO 2: to HERE
 
   return true;
 }
@@ -306,13 +251,11 @@ bool test_calc_acc_y() {
 bool test_advance_pos() {
   const real dt = 0.5;
 
-  thrust::device_vector<Vec2> pos({{1.0, 2.0}});
-  thrust::device_vector<Vec2> pos_prev({{0.5, 3.0}});
-  thrust::device_vector<Vec2> acc({{0.5, -1.0}});
+  vector<Vec2> pos({{1.0, 2.0}});
+  vector<Vec2> pos_prev({{0.5, 3.0}});
+  vector<Vec2> acc({{0.5, -1.0}});
 
-  advance_pos_k<<<1, 32>>>(pos_prev.data().get(), pos.data().get(),
-                        acc.data().get(), pos.size(), dt);
-  cudaDeviceSynchronize();
+  advance_pos(pos, pos_prev, acc, dt);
   pos.swap(pos_prev);
 
   return assert_nearly_eql(

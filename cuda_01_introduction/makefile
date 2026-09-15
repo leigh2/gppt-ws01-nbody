@@ -9,6 +9,9 @@ nbody_port: nbody_port.cu util.hpp
 nbody_gpu: nbody.cu util.hpp
 	nvcc -O3 nbody.cu -o nbody_gpu
 
+nbody_port: nbody_port.cu util.hpp
+	nvcc -O3 nbody_port.cu -o nbody_port
+
 fmt:
 	clang-format -i --style=llvm *.cpp *.cu *.hpp
 
